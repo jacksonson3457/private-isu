@@ -438,12 +438,68 @@ app.get('/logout', async (c: AppContext) => {
 })
 
 app.get('/', async (c: AppContext) => {
+  const startedAt = performance.now()
+
   try {
+    const sessionUserStartedAt = performance.now()
     const me = await getSessionUser(c)
-    const [postRows] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
+    const sessionUserMs = performance.now() - sessionUserStartedAt
+
+    const postsSelectStartedAt = performance.now()
+    const [postRows] = await db.query<RowDataPacket[]>(`
+  SELECT
+    p.id,
+    p.user_id,
+    p.body,
+    p.created_at,
+    p.mime
+  FROM posts AS p
+  INNER JOIN users AS u
+    ON u.id = p.user_id
+  WHERE u.del_flg = 0
+  ORDER BY p.created_at DESC
+  LIMIT 20
+`)
+    const postsSelectMs = performance.now() - postsSelectStartedAt
+
     const posts = postRows as Post[]
+
+    const makePostsStartedAt = performance.now()
     const enriched = await makePosts(posts)
-    return render(c, 'index.ejs', { posts: enriched, me, imageUrl })
+    const makePostsMs = performance.now() - makePostsStartedAt
+
+    const renderStartedAt = performance.now()
+    const response = await render(c, 'index.ejs', {
+      posts: enriched,
+      me,
+      imageUrl,
+    })
+    const renderMs = performance.now() - renderStartedAt
+
+    const totalMs = performance.now() - startedAt
+
+    console.log(
+      JSON.stringify({
+        type: 'get-index-timing',
+        sessionUserMs,
+        postsSelectMs,
+        makePostsMs,
+        renderMs,
+        totalMs,
+      }),
+    )
+
+    response.headers.set(
+      'Server-Timing',
+      [
+        `session-user;dur=${sessionUserMs.toFixed(2)}`,
+        `posts-select;dur=${postsSelectMs.toFixed(2)}`,
+        `make-posts;dur=${makePostsMs.toFixed(2)}`,
+        `render;dur=${renderMs.toFixed(2)}`,
+      ].join(', '),
+    )
+
+    return response
   } catch (e) {
     console.error(e)
     return c.text(String(e instanceof Error ? e.message : e), 500)

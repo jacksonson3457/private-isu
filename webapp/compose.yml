@@ -7,6 +7,7 @@ services:
     volumes:
       - ./etc/nginx/conf.d:/etc/nginx/conf.d
       - ./public:/public
+      - nginx-log:/var/log/nginx
     ports:
       - "80:80"
     networks:
@@ -15,7 +16,7 @@ services:
   app:
     build:
       # Go実装は golang/ PHP実装は php/ Python実装は python/ Node.js実装は node/ に変更
-      context: ruby/
+      context: node/
       dockerfile: Dockerfile
     depends_on:
       - mysql
@@ -57,6 +58,33 @@ services:
           cpus: "1"
           memory: 1g
 
+  slowlog-analyzer:
+    build:
+      context: tools/mysqldumpslow
+    profiles:
+      - tools
+    network_mode: none
+    volumes:
+      - mysql:/var/lib/mysql:ro
+      - ./:/work:ro
+    entrypoint:
+      - mysqldumpslow
+    command:
+      - --help
+
+  accesslog-analyzer:
+    build:
+      context: tools/alp
+    profiles:
+      - tools
+    network_mode: none
+    volumes:
+      - nginx-log:/var/log/nginx:ro
+    entrypoint:
+      - alp
+    command:
+      - --help
+
   memcached:
     image: memcached:1.6
     networks:
@@ -64,6 +92,7 @@ services:
 
 volumes:
   mysql:
+  nginx-log:
 
 networks:
   my_network:
