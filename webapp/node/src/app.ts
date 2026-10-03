@@ -50,7 +50,7 @@ interface User {
 interface Post {
   id: number
   user_id: number
-  imgdata: Buffer
+  imgdata?: Buffer
   body: string
   mime: string
   created_at: Date
@@ -74,6 +74,35 @@ interface CountRow {
 
 interface IdRow {
   id: number
+}
+
+interface PostRow extends RowDataPacket {
+  id: number
+  user_id: number
+  body: string
+  mime: string
+  created_at: Date
+  post_user_id: number
+  post_user_account_name: string
+  post_user_passhash: string
+  post_user_authority: number
+  post_user_del_flg: number
+  post_user_created_at: Date
+}
+
+interface CommentRow extends RowDataPacket {
+  id: number
+  post_id: number
+  user_id: number
+  comment: string
+  created_at: Date
+  comment_count: number
+  comment_user_id: number
+  comment_user_account_name: string
+  comment_user_passhash: string
+  comment_user_authority: number
+  comment_user_del_flg: number
+  comment_user_created_at: Date
 }
 
 interface SessionData {
@@ -252,11 +281,6 @@ async function tryLogin(accountName: string, password: string): Promise<User | u
   return undefined
 }
 
-async function getUser(userId: number) {
-  const [rows] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `id` = ?', [userId])
-  return rows[0] as User
-}
-
 async function dbInitialize(): Promise<void> {
   const sqls = [
     'DELETE FROM users WHERE id > 1000',
@@ -284,37 +308,89 @@ function imageUrl(post: Pick<Post, 'id' | 'mime'>): string {
   return `/image/${post.id}${ext}`
 }
 
-async function makeComment(comment: Comment): Promise<Comment> {
-  comment.user = await getUser(comment.user_id)
-  return comment
-}
-
-async function makePost(post: Post, options: CommentOptions = {}): Promise<Post> {
-  const [[countRow]] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', [post.id])
-  post.comment_count = (countRow as CountRow | undefined)?.count || 0
-  let query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
-  if (!options.allComments) {
-    query += ' LIMIT 3'
+function makePostFromRow(row: PostRow): Post {
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    body: row.body,
+    mime: row.mime,
+    created_at: row.created_at,
+    user: {
+      id: row.post_user_id,
+      account_name: row.post_user_account_name,
+      passhash: row.post_user_passhash,
+      authority: row.post_user_authority,
+      del_flg: row.post_user_del_flg,
+      created_at: row.post_user_created_at,
+    },
   }
-  const [commentRows] = await db.query<RowDataPacket[]>(query, [post.id])
-  const comments = await Promise.all((commentRows as Comment[]).map(makeComment))
-  post.comments = comments.reverse()
-  post.user = await getUser(post.user_id)
-  return post
 }
 
-async function makePosts(posts: Post[], options: { allComments?: boolean } = {}): Promise<Post[]> {
-  const built: Post[] = []
+async function makePosts(posts: Post[], options: CommentOptions = {}): Promise<Post[]> {
+  if (posts.length === 0) return posts
+
+  const postsById = new Map<number, Post>()
   for (const post of posts) {
-    const enriched = await makePost(post, options)
-    if (enriched.user && enriched.user.del_flg === 0) {
-      built.push(enriched)
-    }
-    if (built.length >= POSTS_PER_PAGE) {
-      break
-    }
+    post.comment_count = 0
+    post.comments = []
+    postsById.set(post.id, post)
   }
-  return built
+
+  const rankedComments = `
+    SELECT
+      c.id,
+      c.post_id,
+      c.user_id,
+      c.comment,
+      c.created_at,
+      COUNT(*) OVER (PARTITION BY c.post_id) AS comment_count,
+      ROW_NUMBER() OVER (
+        PARTITION BY c.post_id
+        ORDER BY c.created_at DESC
+      ) AS comment_rank,
+      u.id AS comment_user_id,
+      u.account_name AS comment_user_account_name,
+      u.passhash AS comment_user_passhash,
+      u.authority AS comment_user_authority,
+      u.del_flg AS comment_user_del_flg,
+      u.created_at AS comment_user_created_at
+    FROM comments AS c
+    INNER JOIN users AS u
+      ON u.id = c.user_id
+    WHERE c.post_id IN (?)
+  `
+  const query = options.allComments
+    ? `${rankedComments} ORDER BY c.post_id, c.created_at ASC`
+    : `
+      SELECT *
+      FROM (${rankedComments}) AS ranked
+      WHERE comment_rank <= 3
+      ORDER BY post_id, comment_rank DESC
+    `
+  const [commentRows] = await db.query<CommentRow[]>(query, [posts.map((post) => post.id)])
+
+  for (const row of commentRows) {
+    const post = postsById.get(row.post_id)
+    if (!post) continue
+    post.comment_count = row.comment_count
+    post.comments!.push({
+      id: row.id,
+      post_id: row.post_id,
+      user_id: row.user_id,
+      comment: row.comment,
+      created_at: row.created_at,
+      user: {
+        id: row.comment_user_id,
+        account_name: row.comment_user_account_name,
+        passhash: row.comment_user_passhash,
+        authority: row.comment_user_authority,
+        del_flg: row.comment_user_del_flg,
+        created_at: row.comment_user_created_at,
+      },
+    })
+  }
+
+  return posts
 }
 
 async function render(c: AppContext, view: string, params: RenderParams): Promise<Response> {
@@ -452,17 +528,23 @@ app.get('/', async (c: AppContext) => {
     p.user_id,
     p.body,
     p.created_at,
-    p.mime
+    p.mime,
+    u.id AS post_user_id,
+    u.account_name AS post_user_account_name,
+    u.passhash AS post_user_passhash,
+    u.authority AS post_user_authority,
+    u.del_flg AS post_user_del_flg,
+    u.created_at AS post_user_created_at
   FROM posts AS p
   INNER JOIN users AS u
     ON u.id = p.user_id
   WHERE u.del_flg = 0
   ORDER BY p.created_at DESC
-  LIMIT 20
-`)
+  LIMIT ?
+`, [POSTS_PER_PAGE])
     const postsSelectMs = performance.now() - postsSelectStartedAt
 
-    const posts = postRows as Post[]
+    const posts = (postRows as PostRow[]).map(makePostFromRow)
 
     const makePostsStartedAt = performance.now()
     const enriched = await makePosts(posts)
@@ -512,8 +594,28 @@ app.get('/:accountName{@[A-Za-z0-9_]+}', async (c: AppContext) => {
     const [urows] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', [accountName])
     const user = urows[0] as User
     if (!user) return c.text('not_found', 404)
-    const [postRowData] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC', [user.id])
-    const posts = await makePosts(postRowData as Post[])
+    const [postRowData] = await db.query<PostRow[]>(`
+      SELECT
+        p.id,
+        p.user_id,
+        p.body,
+        p.mime,
+        p.created_at,
+        u.id AS post_user_id,
+        u.account_name AS post_user_account_name,
+        u.passhash AS post_user_passhash,
+        u.authority AS post_user_authority,
+        u.del_flg AS post_user_del_flg,
+        u.created_at AS post_user_created_at
+      FROM posts AS p
+      INNER JOIN users AS u
+        ON u.id = p.user_id
+      WHERE p.user_id = ?
+        AND u.del_flg = 0
+      ORDER BY p.created_at DESC
+      LIMIT ?
+    `, [user.id, POSTS_PER_PAGE])
+    const posts = await makePosts(postRowData.map(makePostFromRow))
     const [commentCountRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', [user.id])
     const commentCount = (commentCountRows[0] as CountRow | undefined)?.count ?? 0
     const [postIdRows] = await db.query<RowDataPacket[]>('SELECT `id` FROM `posts` WHERE `user_id` = ?', [user.id])
@@ -542,8 +644,28 @@ app.get('/posts', async (c: AppContext) => {
     }
     maxCreatedAt = parsed
   }
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC', [maxCreatedAt])
-  const posts = postRows as Post[]
+  const [postRows] = await db.query<PostRow[]>(`
+    SELECT
+      p.id,
+      p.user_id,
+      p.body,
+      p.mime,
+      p.created_at,
+      u.id AS post_user_id,
+      u.account_name AS post_user_account_name,
+      u.passhash AS post_user_passhash,
+      u.authority AS post_user_authority,
+      u.del_flg AS post_user_del_flg,
+      u.created_at AS post_user_created_at
+    FROM posts AS p
+    INNER JOIN users AS u
+      ON u.id = p.user_id
+    WHERE p.created_at <= ?
+      AND u.del_flg = 0
+    ORDER BY p.created_at DESC
+    LIMIT ?
+  `, [maxCreatedAt, POSTS_PER_PAGE])
+  const posts = postRows.map(makePostFromRow)
   const me = await getSessionUser(c)
   const enriched = await makePosts(posts)
   return render(c, 'posts.ejs', { me, imageUrl, posts: enriched })
@@ -551,8 +673,27 @@ app.get('/posts', async (c: AppContext) => {
 
 app.get('/posts/:id', async (c: AppContext) => {
   const id = c.req.param('id')
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT * FROM `posts` WHERE `id` = ?', [id])
-  const posts = postRows as Post[]
+  const [postRows] = await db.query<PostRow[]>(`
+    SELECT
+      p.id,
+      p.user_id,
+      p.body,
+      p.mime,
+      p.created_at,
+      u.id AS post_user_id,
+      u.account_name AS post_user_account_name,
+      u.passhash AS post_user_passhash,
+      u.authority AS post_user_authority,
+      u.del_flg AS post_user_del_flg,
+      u.created_at AS post_user_created_at
+    FROM posts AS p
+    INNER JOIN users AS u
+      ON u.id = p.user_id
+    WHERE p.id = ?
+      AND u.del_flg = 0
+    LIMIT 1
+  `, [id])
+  const posts = postRows.map(makePostFromRow)
   const enriched = await makePosts(posts, { allComments: true })
   const post = enriched[0]
   if (!post) return c.text('not found', 404)
@@ -597,7 +738,7 @@ app.get('/image/:filename{[0-9]+\\.(png|jpg|gif)}', async (c: AppContext) => {
     const post = (posts as Post[])[0]
     if (!post) return c.text('image not found', 404)
     if ((ext === 'jpg' && post.mime === 'image/jpeg') || (ext === 'png' && post.mime === 'image/png') || (ext === 'gif' && post.mime === 'image/gif')) {
-      return new Response(new Uint8Array(post.imgdata), { headers: { 'Content-Type': post.mime } })
+      return new Response(new Uint8Array(post.imgdata!), { headers: { 'Content-Type': post.mime } })
     }
     return c.text('image not found', 404)
   } catch (e) {
