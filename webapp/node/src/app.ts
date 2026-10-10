@@ -6,6 +6,7 @@ import ejs from 'ejs'
 import Memcached from 'memcached'
 import { createPool, Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise'
 import crypto from 'crypto'
+import { mkdir, rename, rm, writeFile } from 'fs/promises'
 import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -26,6 +27,19 @@ type ParsedBody = Record<string, ParsedBodyValue>
 
 const POSTS_PER_PAGE = 20
 const UPLOAD_LIMIT = 10 * 1024 * 1024
+const IMAGE_DIR = path.resolve(__dirname, '../../public/image')
+
+async function writeImage(id: number, ext: string, data: Buffer): Promise<void> {
+  await mkdir(IMAGE_DIR, { recursive: true })
+  const filename = path.join(IMAGE_DIR, `${id}.${ext}`)
+  const temporary = `${filename}.${crypto.randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, data)
+    await rename(temporary, filename)
+  } finally {
+    await rm(temporary, { force: true })
+  }
+}
 
 const db: Pool = createPool({
   host: process.env.ISUCONP_DB_HOST || 'localhost',
@@ -443,6 +457,7 @@ function ensureStringArray(value: ParsedBodyValue): string[] {
 app.get('/initialize', async (c: AppContext) => {
   try {
     await dbInitialize()
+    await rm(IMAGE_DIR, { recursive: true, force: true })
     return c.text('OK')
   } catch (e) {
     console.error(e)
@@ -724,6 +739,14 @@ app.post('/', async (c: AppContext) => {
   const buffer = Buffer.from(await file.arrayBuffer())
   const [result] = await db.query<ResultSetHeader>('INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)', [me.id, mime, buffer, ensureString(body.body)])
   const insertId = result.insertId
+  const ext = path.extname(imageUrl({ id: insertId, mime })).slice(1)
+  if (ext) {
+    try {
+      await writeImage(insertId, ext, buffer)
+    } catch (e) {
+      console.error('failed to write image file', e)
+    }
+  }
   return c.redirect(`/posts/${encodeURIComponent(String(insertId))}`)
 })
 
@@ -738,6 +761,11 @@ app.get('/image/:filename{[0-9]+\\.(png|jpg|gif)}', async (c: AppContext) => {
     const post = (posts as Post[])[0]
     if (!post) return c.text('image not found', 404)
     if ((ext === 'jpg' && post.mime === 'image/jpeg') || (ext === 'png' && post.mime === 'image/png') || (ext === 'gif' && post.mime === 'image/gif')) {
+      try {
+        await writeImage(id, ext, post.imgdata!)
+      } catch (e) {
+        console.error('failed to write image file', e)
+      }
       return new Response(new Uint8Array(post.imgdata!), { headers: { 'Content-Type': post.mime } })
     }
     return c.text('image not found', 404)
