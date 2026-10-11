@@ -7,7 +7,6 @@ import Memcached from 'memcached'
 import { createPool, Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise'
 import crypto from 'crypto'
 import { mkdir, rename, rm, writeFile } from 'fs/promises'
-import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -243,22 +242,8 @@ app.use('*', async (c: AppContext, next: Next): Promise<void> => {
   }
 })
 
-function shellEscape(arg: string): string {
-  if (arg === '') return "''"
-  return `'${arg.replace(/'/g, `'\\''`)}'`
-}
-
 function digest(src: string): string {
-  const command = `printf "%s" ${shellEscape(src)} | openssl dgst -sha512 | sed 's/^.*= //'`
-  const result = spawnSync('/bin/sh', ['-c', command], {
-    encoding: 'utf8'
-  })
-  if (result.error) throw result.error
-  if (result.status !== 0) {
-    const message = (result.stderr || '').toString().trim()
-    throw new Error(`openssl failed: ${message}`)
-  }
-  return result.stdout.replace(/^.*= /, '').trim()
+  return crypto.createHash('sha512').update(src, 'utf8').digest('hex')
 }
 
 function validateUser(accountName: string, password: string): boolean {
